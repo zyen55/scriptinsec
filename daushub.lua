@@ -22,6 +22,7 @@ local selectedBreakIndex = 1
 
 -- Dropdown lists
 local bugTypes = {
+	"All",
 	"Ant",
 	"Pillbug",
 	"Giant Pillbug",
@@ -33,6 +34,7 @@ local bugTypes = {
 }
 
 local breakableTypes = {
+	"All",
 	"Acorn",
 	"Cocoon",
 	"Sugar Cube"
@@ -547,30 +549,14 @@ ToggleBtn.MouseButton1Click:Connect(function()
 	closeAllDropdowns()
 end)
 
--- Core movement & targeting logic with anti-stuck timeout
-local lastTarget = nil
-local timeAtTarget = 0
+-- Core movement logic: teleport once, then stay on the target until it dies
+local STAY_DISTANCE = 15      -- re-teleport only if the target moved farther than this (studs)
+local FIGHT_TIMEOUT = 60      -- safety: give up on a bug/boss/breakable after this many seconds
+local ORB_TIMEOUT = 1         -- orbs are skipped after this many seconds
 
-local function moveTo(targetCFrame, targetObj)
+local function teleportTo(targetCFrame)
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root then return end
-
-	if lastTarget == targetObj then
-		timeAtTarget = timeAtTarget + cooldown
-		-- Orbs are skipped after 0.5s; bugs/boss/breakables get 5s so you can finish the whole carcass.
-		local isBugOrBreakable = targetObj and (trackedTargets.bug[targetObj] or trackedTargets.boss[targetObj] or trackedTargets.breakable[targetObj])
-		local timeoutLimit = isBugOrBreakable and 5.0 or 0.5
-
-		if timeAtTarget >= timeoutLimit then
-			blacklistedTargets[targetObj] = true
-			lastTarget = nil
-			timeAtTarget = 0
-			return
-		end
-	else
-		lastTarget = targetObj
-		timeAtTarget = 0
-	end
 
 	if autoTweenToggle() then
 		local dist = (root.Position - targetCFrame.Position).Magnitude
@@ -582,6 +568,31 @@ local function moveTo(targetCFrame, targetObj)
 		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
 		root.CFrame = targetCFrame
 	end
+end
+
+local function getTargetPart(obj)
+	if obj:IsA("BasePart") then
+		return obj
+	elseif obj:IsA("Model") then
+		return obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")
+	end
+	return nil
+end
+
+-- Bugs/boss/breakables (incl. their carcass) count as gone only when the object is removed from the game.
+-- Orbs are also treated as gone if their health value says so.
+local function isGone(obj, category)
+	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then return true end
+	if category == "bug" or category == "boss" or category == "breakable" then
+		return false
+	end
+	local hum = obj:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health <= 0 then return true end
+	local healthVal = obj:FindFirstChild("Health")
+	if healthVal and healthVal:IsA("ValueBase") and type(healthVal.Value) == "number" and healthVal.Value <= 0 then
+		return true
+	end
+	return false
 end
 
 local function getClosest(category, yOffset, targetNameStr)
@@ -644,31 +655,71 @@ local function getClosest(category, yOffset, targetNameStr)
 end
 
 -- Main farm loop (priority: orbs > boss > bugs > breakables)
+local function pickTarget()
+	local cf, obj
+
+	if autoOrbs() then
+		cf, obj = getClosest("orb", 0)
+		if cf then return cf, obj, "orb", 0 end
+	end
+	if autoSandOrbs() then
+		cf, obj = getClosest("sandorb", 0)
+		if cf then return cf, obj, "sandorb", 0 end
+	end
+	if autoVoidOrbs() then
+		cf, obj = getClosest("voidorb", 0)
+		if cf then return cf, obj, "voidorb", 0 end
+	end
+	if autoBoss() then
+		cf, obj = getClosest("boss", 3)
+		if cf then return cf, obj, "boss", 3 end
+	end
+	if autoBugs() then
+		local bugName = bugTypes[getBugTier()]
+		if bugName == "All" then bugName = nil end
+		cf, obj = getClosest("bug", 3, bugName)
+		if cf then return cf, obj, "bug", 3 end
+	end
+	if autoBreakables() then
+		local breakName = breakableTypes[getBreakTier()]
+		if breakName == "All" then breakName = nil end
+		cf, obj = getClosest("breakable", 3, breakName)
+		if cf then return cf, obj, "breakable", 3 end
+	end
+	return nil
+end
+
 task.spawn(function()
+	local currentObj, currentCategory, currentY, targetStart = nil, nil, 0, 0
+
 	while ScreenGui and ScreenGui.Parent do
-		local cf, obj
+		local root = character and character:FindFirstChild("HumanoidRootPart")
 
-		if autoOrbs() then
-			cf, obj = getClosest("orb", 0)
-		end
-		if not cf and autoSandOrbs() then
-			cf, obj = getClosest("sandorb", 0)
-		end
-		if not cf and autoVoidOrbs() then
-			cf, obj = getClosest("voidorb", 0)
-		end
-		if not cf and autoBoss() then
-			cf, obj = getClosest("boss", 3)
-		end
-		if not cf and autoBugs() then
-			cf, obj = getClosest("bug", 3, bugTypes[getBugTier()])
-		end
-		if not cf and autoBreakables() then
-			cf, obj = getClosest("breakable", 3, breakableTypes[getBreakTier()])
-		end
+		if root then
+			-- Still locked on a target: stay on it until it dies
+			if currentObj then
+				local isOrb = (currentCategory == "orb" or currentCategory == "sandorb" or currentCategory == "voidorb")
+				local limit = isOrb and ORB_TIMEOUT or FIGHT_TIMEOUT
 
-		if cf and obj then
-			pcall(moveTo, cf, obj)
+				if isGone(currentObj, currentCategory) or (tick() - targetStart) >= limit then
+					blacklistedTargets[currentObj] = true
+					currentObj = nil
+				else
+					local part = getTargetPart(currentObj)
+					if part and (root.Position - part.Position).Magnitude > STAY_DISTANCE then
+						pcall(teleportTo, part.CFrame + Vector3.new(0, currentY, 0))
+					end
+				end
+			end
+
+			-- No target: pick the next one and teleport to it once
+			if not currentObj then
+				local cf, obj, cat, y = pickTarget()
+				if cf and obj then
+					currentObj, currentCategory, currentY, targetStart = obj, cat, y, tick()
+					pcall(teleportTo, cf)
+				end
+			end
 		end
 
 		task.wait(cooldown)
